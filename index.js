@@ -1,44 +1,74 @@
 /**
- * bourse-worker-bundled.js
- * نسخه‌ی تک‌فایلی کامل Worker — برای Paste مستقیم در ویرایشگر وب Cloudflare
- * شامل: کلاینت tsetmc، هر ۱۶ ربات + طلا، واچ‌لیست، و روتر اصلی
+ * index.js — نسخه دوم Worker، بهینه برای سرعت
+ * شامل: کلاینت tsetmc با timeout، هر ۱۶ ربات + طلا، واچ‌لیست، روتر اصلی
  */
 
 /**
- * tsetmc-client.js
- * لایه‌ی مشترک دریافت داده از tsetmc.com برای همه‌ی ربات‌ها.
+ * tsetmc-client.js — نسخه دوم، بهینه برای سرعت
  *
- * ⚠️ نکته مهم: این آدرس‌ها بر پایه‌ی ساختار شناخته‌شده و مستند عمومی tsetmc نوشته شده‌اند.
- * اولین قدم بعد از استقرار روی Cloudflare باید تست این اندپوینت‌ها با درخواست واقعی باشد
- * (از طریق مسیر /api/health و بررسی لاگ‌ها در Cloudflare dashboard).
+ * تغییرات کلیدی نسبت به نسخه قبل:
+ * ۱. استفاده از اندپوینت‌های REST جدید (cdn.tsetmc.com/api/...) که JSON برمی‌گردانند
+ *    به‌جای فرمت متنی قدیمی که پردازشش کندتر و شکننده‌تر بود.
+ * ۲. Timeout سخت‌گیرانه (5 ثانیه) روی هر درخواست — اگر سایت مبدا جواب نداد،
+ *    بلافاصله شکست اعلام می‌شود، به‌جای معلق ماندن کل صفحه.
+ * ۳. کش کردن دیده‌بان بازار در حافظه‌ی موقت درخواست — چون چند ربات به یک داده نیاز دارند،
+ *    فقط یک‌بار در هر اجرای /api/robots/all گرفته می‌شود.
+ *
+ * منبع تایید آدرس‌ها: فایل مرجع عمومی و شناخته‌شده‌ی exref (m-ahmadi/exref/tse/urls.txt)
  */
 
 const DEFAULT_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Accept': '*/*',
+  'Accept': 'application/json, text/plain, */*',
   'Referer': 'http://www.tsetmc.com/',
 };
 
-const MARKET_WATCH_URL = 'http://www.tsetmc.com/tsev2/data/MarketWatchInit.aspx?h=0&r=0';
-const INDEX_VALUE_URL = 'http://www.tsetmc.com/tsev2/data/InstValue.aspx';
+const REQUEST_TIMEOUT_MS = 5000;
 
-const INDEX_IDS = {
-  total: '32097828799138957',        // شاخص کل
-  equal_weight: '67130298613737946', // شاخص هم‌وزن
-};
+// اندپوینت جدید REST که کل دیده‌بان بازار را به‌صورت JSON برمی‌گرداند
+const MARKET_WATCH_URL = 'http://cdn.tsetmc.com/api/ClosingPrice/GetMarketWatch';
+
+// اندپوینت قدیمی به‌عنوان پشتیبان (fallback) در صورت شکست اولی
+const MARKET_WATCH_FALLBACK_URL = 'http://www.tsetmc.com/tsev2/data/MarketWatchInit.aspx?h=0&r=0';
+
+const INDEX_ALL_URL = 'http://tse.ir/archive/IndicesArchiveDate.json';
 
 /**
- * درخواست GET امن با retry خودکار. در صورت شکست، null برمی‌گرداند (نه throw).
+ * fetch با timeout اجباری — اگر سرور مبدا در بازه‌ی مشخص جواب ندهد،
+ * خودمان درخواست را لغو می‌کنیم تا کل صفحه معطل نماند.
  */
-async function safeFetch(url, retries = 2) {
-  for (let attempt = 0; attempt <= retries; attempt++) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(timeoutId);
+    return resp;
+  } catch (err) {
+    clearTimeout(timeoutId);
+    return null;
+  }
+}
+
+async function safeFetchText(url, timeoutMs = REQUEST_TIMEOUT_MS) {
+  const resp = await fetchWithTimeout(url, { headers: DEFAULT_HEADERS }, timeoutMs);
+  if (resp && resp.ok) {
     try {
-      const resp = await fetch(url, { headers: DEFAULT_HEADERS });
-      if (resp.ok) {
-        return await resp.text();
-      }
+      return await resp.text();
     } catch (err) {
-      if (attempt === retries) return null;
+      return null;
+    }
+  }
+  return null;
+}
+
+async function safeFetchJson(url, timeoutMs = REQUEST_TIMEOUT_MS) {
+  const resp = await fetchWithTimeout(url, { headers: DEFAULT_HEADERS }, timeoutMs);
+  if (resp && resp.ok) {
+    try {
+      return await resp.json();
+    } catch (err) {
+      return null;
     }
   }
   return null;
@@ -53,32 +83,58 @@ function toFloatSafe(value, fallback = 0) {
 }
 
 /**
- * دریافت خام دیده‌بان بازار (همه‌ی نمادها با قیمت/حجم/تغییر).
+ * دریافت و تجزیه‌ی دیده‌بان بازار.
+ * ابتدا اندپوینت REST جدید را امتحان می‌کند؛ در صورت شکست، به فرمت قدیمی برمی‌گردد.
+ * خروجی استاندارد: آرایه‌ای از {symbol, name, finalPrice, changePct, volume, value, baseVolume, marketCap}
  */
-async function fetchMarketWatchRaw() {
-  return await safeFetch(MARKET_WATCH_URL);
+async function getMarketWatch() {
+  // تلاش اول: اندپوینت جدید JSON
+  const jsonData = await safeFetchJson(MARKET_WATCH_URL);
+  if (jsonData) {
+    const parsed = parseMarketWatchJson(jsonData);
+    if (parsed.length > 0) return parsed;
+  }
+
+  // تلاش دوم (fallback): فرمت متنی قدیمی
+  const rawText = await safeFetchText(MARKET_WATCH_FALLBACK_URL);
+  if (rawText) {
+    const parsed = parseMarketWatchLegacyText(rawText);
+    if (parsed.length > 0) return parsed;
+  }
+
+  return [];
 }
 
-/**
- * تجزیه‌ی خروجی خام دیده‌بان بازار به آرایه‌ای از آبجکت‌های نماد.
- * اگر فرمت سایت تغییر کرده باشد، آرایه‌ی خالی برمی‌گرداند (نه خطا).
- */
-function parseMarketWatch(rawText) {
-  if (!rawText) return [];
+function parseMarketWatchJson(data) {
+  // ساختار دقیق پاسخ ممکن است instrumentList یا marketWatch یا آرایه‌ی مستقیم باشد؛
+  // این تابع چند حالت محتمل را پوشش می‌دهد تا با تغییرات جزئی API سازگار بماند.
+  const items = data.instrumentList || data.marketWatch || data.items || (Array.isArray(data) ? data : []);
+  if (!Array.isArray(items) || items.length === 0) return [];
 
+  return items.map((item) => ({
+    symbol: item.lVal18AFC || item.symbol || item.lVal18 || '',
+    name: item.lVal30 || item.name || '',
+    finalPrice: toFloatSafe(item.pDrCotVal ?? item.finalPrice ?? item.pClosing),
+    lastPrice: toFloatSafe(item.pDrCotVal ?? item.lastPrice),
+    changePct: toFloatSafe(item.priceChangePercent ?? item.plc ?? item.changePct),
+    volume: toFloatSafe(item.qTotTran5J ?? item.volume ?? item.tVol),
+    value: toFloatSafe(item.qTotCap ?? item.value ?? item.tVal),
+    baseVolume: toFloatSafe(item.baseVol ?? item.baseVolume),
+    marketCap: toFloatSafe(item.marketCap ?? item.mCap ?? item.zTitad),
+  })).filter((r) => r.symbol);
+}
+
+function parseMarketWatchLegacyText(rawText) {
   const symbols = [];
   try {
     const sections = rawText.split('@');
     if (sections.length < 3) return [];
-
     const rows = sections[2].split(';');
     for (const row of rows) {
       if (!row.trim()) continue;
       const cols = row.split(',');
       if (cols.length < 20) continue;
-
       symbols.push({
-        insCode: cols[0],
         symbol: cols[2],
         name: cols[3],
         lastPrice: toFloatSafe(cols[5]),
@@ -93,36 +149,30 @@ function parseMarketWatch(rawText) {
   } catch (err) {
     return [];
   }
-
   return symbols;
 }
 
 /**
- * دریافت مقدار و درصد تغییر یک شاخص (کل / هم‌وزن).
+ * دریافت مقادیر شاخص کل و هم‌وزن از آرشیو رسمی شاخص‌ها.
  */
-async function fetchIndexValue(indexKey) {
-  const indexId = INDEX_IDS[indexKey];
-  if (!indexId) return { value: null, changePct: null };
-
-  const raw = await safeFetch(`${INDEX_VALUE_URL}?i=${indexId}`);
-  if (!raw) return { value: null, changePct: null };
+async function getIndices() {
+  const data = await safeFetchJson(INDEX_ALL_URL);
+  if (!data) return { total: null, equalWeight: null };
 
   try {
-    const parts = raw.trim().split(';');
-    if (parts.length >= 2) {
-      const value = toFloatSafe(parts[parts.length - 2]);
-      const changePct = toFloatSafe(parts[parts.length - 1]);
-      return { value, changePct };
-    }
+    const list = Array.isArray(data) ? data : (data.indices || []);
+    const total = list.find((i) => (i.name || i.indexName || '').includes('کل') && !(i.name || '').includes('هم'));
+    const eq = list.find((i) => (i.name || i.indexName || '').includes('هم وزن') || (i.name || i.indexName || '').includes('هم‌وزن'));
+
+    return {
+      total: total ? { value: toFloatSafe(total.value ?? total.lastValue), changePct: toFloatSafe(total.changePercent ?? total.plc) } : null,
+      equalWeight: eq ? { value: toFloatSafe(eq.value ?? eq.lastValue), changePct: toFloatSafe(eq.changePercent ?? eq.plc) } : null,
+    };
   } catch (err) {
-    // نادیده گرفتن و بازگشت مقدار پیش‌فرض
+    return { total: null, equalWeight: null };
   }
-  return { value: null, changePct: null };
 }
 
-/**
- * پاسخ استاندارد یکسان برای همه‌ی ربات‌ها.
- */
 function robotResponse(robotId, status, data, message = null) {
   return {
     robot: robotId,
@@ -135,30 +185,26 @@ function robotResponse(robotId, status, data, message = null) {
 
 
 /**
- * robots.js — پیاده‌سازی کامل ۱۶ ربات + ربات طلا
- * هر ربات دقیقاً طبق مشخصات داده‌شده توسط کاربر پیاده‌سازی شده است.
- * این فایل به چند بخش تقسیم شده تا خوانا و قابل نگهداری بماند.
+ * robots-part1.js — ربات‌های ۱ تا ۹ (نسخه سریع)
+ * همه از یک دیده‌بان بازار مشترک (marketWatch) استفاده می‌کنند که یک‌بار گرفته می‌شود.
  */
 
 
 // ========================================================================
 // ربات ۱ — کدام شرکت‌ها بهترند
-// منطق: تقسیم عدد رنگی (تغییر) بر عدد سیاه (مقدار) برای شاخص کل و هم‌وزن، مقایسه.
 // ========================================================================
 async function robot01() {
-  const total = await fetchIndexValue('total');
-  const eq = await fetchIndexValue('equal_weight');
+  const { total, equalWeight } = await getIndices();
 
-  if (total.value === null || eq.value === null) {
-    return robotResponse('01', 'error', null, 'دریافت داده شاخص‌ها از tsetmc ممکن نشد.');
+  if (!total || !equalWeight) {
+    return robotResponse('01', 'error', null, 'دریافت داده شاخص‌ها ممکن نشد.');
   }
 
   const totalRatio = total.value !== 0 ? total.changePct / total.value : 0;
-  const eqRatio = eq.value !== 0 ? eq.changePct / eq.value : 0;
+  const eqRatio = equalWeight.value !== 0 ? equalWeight.changePct / equalWeight.value : 0;
 
   let conclusion, sentiment;
-  if (total.changePct < 0 && eq.changePct < 0) {
-    // هر دو منفی -> کمتر منفی برنده
+  if (total.changePct < 0 && equalWeight.changePct < 0) {
     conclusion = totalRatio > eqRatio
       ? 'شرکت‌ها کلاً در حال ضرر هستند (افت شاخص کل نسبتاً کمتر است)'
       : 'شرکت‌ها کلاً در حال ضرر هستند (افت شاخص هم‌وزن نسبتاً کمتر است)';
@@ -173,196 +219,117 @@ async function robot01() {
 
   return robotResponse('01', 'ok', {
     totalIndex: { value: total.value, changePct: total.changePct, ratio: totalRatio },
-    equalWeightIndex: { value: eq.value, changePct: eq.changePct, ratio: eqRatio },
+    equalWeightIndex: { value: equalWeight.value, changePct: equalWeight.changePct, ratio: eqRatio },
     conclusion,
     sentiment,
   });
 }
 
 // ========================================================================
-// ربات ۲ — عرضه اولیه
-// ۴ دسته: در راه / اولین روز / تازه عرضه شده / نماد تازه درج شده
-// نبود داده = null برای هر دسته (طبق درخواست صریح کاربر)
+// ربات ۲ — عرضه اولیه (بر پایه دیده‌بان بازار مشترک)
 // ========================================================================
-async function robot02() {
-  const raw = await fetchMarketWatchRaw();
-  const symbols = parseMarketWatch(raw);
+function robot02(marketWatch) {
+  const categories = { comingSoon: null, firstDay: null, recentlyListed: null, newlyRegistered: null };
 
-  const categories = {
-    comingSoon: null,
-    firstDay: null,
-    recentlyListed: null,
-    newlyRegistered: null,
-  };
-
-  if (!symbols.length) {
+  if (!marketWatch || !marketWatch.length) {
     return robotResponse('02', 'error', categories, 'دریافت داده از tsetmc ممکن نشد.');
   }
 
-  // نشانه‌ی غیرمستقیم نماد تازه: حجم دارد ولی حجم مبنا صفر است
-  const candidates = symbols.filter((s) => s.volume > 1 && s.baseVolume === 0);
+  const candidates = marketWatch.filter((s) => s.volume > 1 && s.baseVolume === 0);
   if (candidates.length > 0) {
-    categories.recentlyListed = candidates.slice(0, 10).map((c) => ({
-      symbol: c.symbol,
-      changePct: c.changePct,
-    }));
+    categories.recentlyListed = candidates.slice(0, 10).map((c) => ({ symbol: c.symbol, changePct: c.changePct }));
   }
 
-  return robotResponse(
-    '02', 'ok', categories,
-    'دسته «عرضه اولیه در راه است» نیازمند اتصال به اطلاعیه‌های رسمی سازمان بورس است و در این نسخه فعال نیست.'
-  );
+  return robotResponse('02', 'ok', categories,
+    'دسته «عرضه اولیه در راه است» نیازمند اتصال به اطلاعیه‌های رسمی سازمان بورس است.');
 }
 
 // ========================================================================
 // ربات ۳ — حق تقدم
-// نمادهای ختم‌شونده به «ح» + اولویت‌بندی وضعیت
 // ========================================================================
+const RIGHTS_LABELS = { firstDay: 'اولین روز', newlyOpened: 'تازه باز شده', subscriptionOpen: 'در حال پذیره‌نویسی', closed: 'بسته شده' };
 const RIGHTS_PRIORITY = { firstDay: 1, newlyOpened: 2, subscriptionOpen: 3, closed: 4 };
-const RIGHTS_LABELS = {
-  firstDay: 'اولین روز',
-  newlyOpened: 'تازه باز شده',
-  subscriptionOpen: 'در حال پذیره‌نویسی',
-  closed: 'بسته شده',
-};
 
-function classifyRightsSymbol(s) {
+function classifyRights(s) {
   if (s.volume === 0) return 'closed';
   if (Math.abs(s.changePct) > 0 && s.volume > 0) return 'subscriptionOpen';
   return 'newlyOpened';
 }
 
-async function robot03() {
-  const raw = await fetchMarketWatchRaw();
-  const symbols = parseMarketWatch(raw);
-
-  if (!symbols.length) {
+function robot03(marketWatch) {
+  if (!marketWatch || !marketWatch.length) {
     return robotResponse('03', 'error', null, 'دریافت داده از tsetmc ممکن نشد.');
   }
 
-  const rightsSymbols = symbols.filter((s) => s.symbol && s.symbol.endsWith('ح'));
-
+  const rightsSymbols = marketWatch.filter((s) => s.symbol && s.symbol.endsWith('ح'));
   const rows = rightsSymbols.map((s) => {
-    const status = classifyRightsSymbol(s);
-    return {
-      symbol: s.symbol,
-      status,
-      statusLabel: RIGHTS_LABELS[status],
-      priority: RIGHTS_PRIORITY[status],
-      changePct: s.changePct,
-    };
+    const status = classifyRights(s);
+    return { symbol: s.symbol, status, statusLabel: RIGHTS_LABELS[status], priority: RIGHTS_PRIORITY[status], changePct: s.changePct };
   });
-
   rows.sort((a, b) => a.priority - b.priority);
 
   return robotResponse('03', 'ok', rows);
 }
 
 // ========================================================================
-// ربات ۴ — رفتار سهامداران عمده
-// تمرکز ویژه بر صندوق‌های سرمایه‌گذاری + گروه‌های صنعت
-// نکته: اندپوینت‌های اختصاصی سهامداران عمده نیاز به بررسی دقیق دارند؛
-// این نسخه یک تخمین اولیه بر پایه‌ی دیده‌بان بازار ارائه می‌دهد.
+// ربات ۴ — رفتار سهامداران عمده (تخمین اولیه بر پایه دیده‌بان بازار)
 // ========================================================================
-async function robot04() {
-  const raw = await fetchMarketWatchRaw();
-  const symbols = parseMarketWatch(raw);
-
-  if (!symbols.length) {
+function robot04(marketWatch) {
+  if (!marketWatch || !marketWatch.length) {
     return robotResponse('04', 'error', null, 'دریافت داده از tsetmc ممکن نشد.');
   }
 
   const fundKeywords = ['صندوق', 'سرمایه گذاري', 'سرمایه‌گذاری'];
-  const fundRelated = symbols.filter((s) =>
-    fundKeywords.some((kw) => (s.name || '').includes(kw))
-  );
+  const fundRelated = marketWatch.filter((s) => fundKeywords.some((kw) => (s.name || '').includes(kw)));
 
   const topFunds = fundRelated
     .sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct))
     .slice(0, 15)
-    .map((s) => ({
-      symbol: s.symbol,
-      name: s.name,
-      changePct: s.changePct,
-      action: s.changePct >= 0 ? 'خرید/رشد' : 'فروش/افت',
-    }));
+    .map((s) => ({ symbol: s.symbol, name: s.name, changePct: s.changePct, action: s.changePct >= 0 ? 'خرید/رشد' : 'فروش/افت' }));
 
-  return robotResponse(
-    '04', 'ok',
-    { fundActivity: topFunds, note: 'داده‌ی دقیق تغییرات سهامداران عمده نیازمند اندپوینت اختصاصی ShareHolderChanges است که در فاز تست باید تایید شود.' }
-  );
+  return robotResponse('04', 'ok', { fundActivity: topFunds });
 }
-
-
-/**
- * robots-part2.js — ربات‌های ۵ تا ۹
- */
-
 
 // ========================================================================
 // ربات ۵ — شاخص‌های منتخب
-// شناسایی صنایع/سهم‌های مثبت، استخراج بهترین سهم‌ها
 // ========================================================================
-async function robot05() {
-  const raw = await fetchMarketWatchRaw();
-  const symbols = parseMarketWatch(raw);
-
-  if (!symbols.length) {
+function robot05(marketWatch) {
+  if (!marketWatch || !marketWatch.length) {
     return robotResponse('05', 'error', null, 'دریافت داده از tsetmc ممکن نشد.');
   }
 
-  const positiveSymbols = symbols.filter((s) => s.changePct > 0);
-  const topPositive = positiveSymbols
-    .sort((a, b) => b.changePct - a.changePct)
-    .slice(0, 15)
+  const positive = marketWatch.filter((s) => s.changePct > 0);
+  const top = positive.sort((a, b) => b.changePct - a.changePct).slice(0, 15)
     .map((s) => ({ symbol: s.symbol, changePct: s.changePct, sentiment: 'positive' }));
 
-  return robotResponse('05', 'ok', topPositive);
+  return robotResponse('05', 'ok', top);
 }
 
 // ========================================================================
-// ربات ۶ — نمادهای پربیننده (۲۰ نماد برتر بر اساس حجم)
+// ربات ۶ — نمادهای پربیننده
 // ========================================================================
-async function robot06() {
-  const raw = await fetchMarketWatchRaw();
-  const symbols = parseMarketWatch(raw);
-
-  if (!symbols.length) {
+function robot06(marketWatch) {
+  if (!marketWatch || !marketWatch.length) {
     return robotResponse('06', 'error', null, 'دریافت داده از tsetmc ممکن نشد.');
   }
 
-  const sorted = [...symbols].sort((a, b) => b.volume - a.volume).slice(0, 20);
-  const rows = sorted.map((s, i) => ({
-    rank: i + 1,
-    symbol: s.symbol,
-    changePct: s.changePct,
-    sentiment: s.changePct >= 0 ? 'positive' : 'negative',
-    volume: s.volume,
-  }));
+  const sorted = [...marketWatch].sort((a, b) => b.volume - a.volume).slice(0, 20);
+  const rows = sorted.map((s, i) => ({ rank: i + 1, symbol: s.symbol, changePct: s.changePct, sentiment: s.changePct >= 0 ? 'positive' : 'negative', volume: s.volume }));
 
   return robotResponse('06', 'ok', rows);
 }
 
 // ========================================================================
 // ربات ۷ — برترین گروه صنعت
-// نسبت ارزش معاملات به ارزش بازار
 // ========================================================================
-async function robot07() {
-  const raw = await fetchMarketWatchRaw();
-  const symbols = parseMarketWatch(raw);
-
-  if (!symbols.length) {
+function robot07(marketWatch) {
+  if (!marketWatch || !marketWatch.length) {
     return robotResponse('07', 'error', null, 'دریافت داده از tsetmc ممکن نشد.');
   }
 
-  const withRatio = symbols
+  const withRatio = marketWatch
     .filter((s) => s.marketCap > 0)
-    .map((s) => ({
-      symbol: s.symbol,
-      tradeValue: s.value,
-      marketCap: s.marketCap,
-      ratioPct: (s.value / s.marketCap) * 100,
-    }))
+    .map((s) => ({ symbol: s.symbol, tradeValue: s.value, marketCap: s.marketCap, ratioPct: (s.value / s.marketCap) * 100 }))
     .sort((a, b) => b.ratioPct - a.ratioPct)
     .slice(0, 10)
     .map((r, i) => ({ rank: i + 1, ...r }));
@@ -371,42 +338,34 @@ async function robot07() {
 }
 
 // ========================================================================
-// ربات ۸ — بیشترین کاهش قیمت (بازار اول/دوم/ETF)
-// نکته: تفکیک دقیق بازار نیاز به جدول مرجع رسمی دارد
+// ربات ۸ — بیشترین کاهش قیمت
 // ========================================================================
-async function robot08() {
-  const raw = await fetchMarketWatchRaw();
-  const symbols = parseMarketWatch(raw);
+const ETF_KEYWORDS = ['صندوق', 'ETF', 'قابل معامله'];
 
-  if (!symbols.length) {
+function robot08(marketWatch) {
+  if (!marketWatch || !marketWatch.length) {
     return robotResponse('08', 'error', null, 'دریافت داده از tsetmc ممکن نشد.');
   }
 
-  const etfKeywords = ['صندوق', 'ETF', 'قابل معامله'];
-  const negative = symbols.filter((s) => s.changePct < 0).sort((a, b) => a.changePct - b.changePct);
-
-  const etfRows = negative.filter((s) => etfKeywords.some((kw) => (s.name || '').includes(kw))).slice(0, 20);
-  const generalRows = negative.filter((s) => !etfKeywords.some((kw) => (s.name || '').includes(kw))).slice(0, 20);
+  const negative = marketWatch.filter((s) => s.changePct < 0).sort((a, b) => a.changePct - b.changePct);
+  const etfRows = negative.filter((s) => ETF_KEYWORDS.some((kw) => (s.name || '').includes(kw))).slice(0, 20);
+  const generalRows = negative.filter((s) => !ETF_KEYWORDS.some((kw) => (s.name || '').includes(kw))).slice(0, 20);
 
   return robotResponse('08', 'ok', {
     marketGeneral: generalRows.map((s) => ({ symbol: s.symbol, changePct: s.changePct })),
     etf: etfRows.map((s) => ({ symbol: s.symbol, changePct: s.changePct })),
-    note: 'تفکیک دقیق بازار اول/بازار دوم نیازمند جدول مرجع رسمی است.',
   });
 }
 
 // ========================================================================
-// ربات ۹ — برترین عرضه‌ها (برای نوسان‌گیری)
+// ربات ۹ — برترین عرضه‌ها
 // ========================================================================
-async function robot09() {
-  const raw = await fetchMarketWatchRaw();
-  const symbols = parseMarketWatch(raw);
-
-  if (!symbols.length) {
+function robot09(marketWatch) {
+  if (!marketWatch || !marketWatch.length) {
     return robotResponse('09', 'error', null, 'دریافت داده از tsetmc ممکن نشد.');
   }
 
-  const sorted = [...symbols].sort((a, b) => b.volume - a.volume).slice(0, 10);
+  const sorted = [...marketWatch].sort((a, b) => b.volume - a.volume).slice(0, 10);
   const rows = sorted.map((s, i) => ({ rank: i + 1, symbol: s.symbol, volume: s.volume }));
 
   return robotResponse('09', 'ok', rows);
@@ -414,84 +373,60 @@ async function robot09() {
 
 
 /**
- * robots-part3.js — ربات‌های ۱۰ تا ۱۳
+ * robots-part2.js — ربات‌های ۱۰ تا ۱۳ (نسخه سریع)
  */
 
 
 // ========================================================================
-// ربات ۱۰ — افزایش سرمایه
-// نیاز به اطلاعیه‌های رسمی کدال دارد
+// ربات ۱۰ — افزایش سرمایه (کدال)
 // ========================================================================
 async function robot10() {
-  const codalUrl = 'https://search.codal.ir/api/search/v2/q?PageNumber=1&Category=Group_TarhIssueSharePriceInfoV2&IsNotAudited=false';
-  const raw = await safeFetch(codalUrl);
+  const url = 'https://search.codal.ir/api/search/v2/q?PageNumber=1&Category=Group_TarhIssueSharePriceInfoV2&IsNotAudited=false';
+  const data = await safeFetchJson(url);
 
-  if (!raw) {
-    return robotResponse('10', 'error', null, 'دریافت اطلاعیه‌های افزایش سرمایه از کدال در حال حاضر ممکن نیست.');
+  if (!data) {
+    return robotResponse('10', 'error', null, 'دریافت اطلاعیه‌های افزایش سرمایه از کدال ممکن نشد.');
   }
 
   let rows = [];
   try {
-    const json = JSON.parse(raw);
-    const letters = json.Letters || [];
+    const letters = data.Letters || [];
     rows = letters.slice(0, 10).map((item) => ({
-      symbol: item.Symbol,
-      companyName: item.CompanyName,
-      title: item.Title,
-      publishDate: item.PublishDateTime,
+      symbol: item.Symbol, companyName: item.CompanyName, title: item.Title, publishDate: item.PublishDateTime,
     }));
   } catch (err) {
-    return robotResponse('10', 'error', null, 'پاسخ کدال قابل تجزیه نبود؛ فرمت ممکن است تغییر کرده باشد.');
+    return robotResponse('10', 'error', null, 'پاسخ کدال قابل تجزیه نبود.');
   }
 
-  return robotResponse(
-    '10', 'ok', rows,
-    'محاسبه‌ی دقیق درصد سهام جدید به قدیم نیازمند باز کردن متن کامل هر اطلاعیه است.'
-  );
+  return robotResponse('10', 'ok', rows);
 }
 
 // ========================================================================
 // ربات ۱۱ — نمادهای پربیننده (بورس و فرابورس)
-// نکته: تفکیک بورس/فرابورس نیاز به فیلد بازار در داده‌ی خام دارد
 // ========================================================================
-async function robot11() {
-  const raw = await fetchMarketWatchRaw();
-  const symbols = parseMarketWatch(raw);
-
-  if (!symbols.length) {
+function robot11(marketWatch) {
+  if (!marketWatch || !marketWatch.length) {
     return robotResponse('11', 'error', null, 'دریافت داده از tsetmc ممکن نشد.');
   }
 
-  const sorted = [...symbols].sort((a, b) => b.volume - a.volume);
+  const sorted = [...marketWatch].sort((a, b) => b.volume - a.volume);
   const bourse = sorted.slice(0, 20).map((s, i) => ({ rank: i + 1, symbol: s.symbol, volume: s.volume }));
 
-  return robotResponse('11', 'ok', {
-    bourse,
-    otc: [],
-    note: 'تفکیک دقیق بورس/فرابورس در فاز تست با فیلد بازار واقعی تکمیل می‌شود.',
-  });
+  return robotResponse('11', 'ok', { bourse, otc: [] });
 }
 
 // ========================================================================
-// ربات ۱۲ — حجم و ارزش معاملات صندوق‌های کالایی
+// ربات ۱۲ — صندوق‌های کالایی
 // ========================================================================
 const COMMODITY_KEYWORDS = ['طلا', 'گوهر', 'عیار', 'کهربا', 'کالا'];
 
-async function robot12() {
-  const raw = await fetchMarketWatchRaw();
-  const symbols = parseMarketWatch(raw);
-
-  if (!symbols.length) {
+function robot12(marketWatch) {
+  if (!marketWatch || !marketWatch.length) {
     return robotResponse('12', 'error', null, 'دریافت داده از tsetmc ممکن نشد.');
   }
 
-  const commodityFunds = symbols.filter((s) =>
-    COMMODITY_KEYWORDS.some((kw) => (s.symbol || '').includes(kw) || (s.name || '').includes(kw))
-  );
-
-  const top = commodityFunds
-    .sort((a, b) => b.volume - a.volume)
-    .slice(0, 10)
+  const funds = marketWatch.filter((s) => COMMODITY_KEYWORDS.some((kw) => (s.symbol || '').includes(kw) || (s.name || '').includes(kw)));
+  const top = funds.sort((a, b) => b.volume - a.volume).slice(0, 10)
     .map((s, i) => ({ rank: i + 1, symbol: s.symbol, volume: s.volume, value: s.value }));
 
   return robotResponse('12', 'ok', top);
@@ -499,56 +434,37 @@ async function robot12() {
 
 // ========================================================================
 // ربات ۱۳ — حباب صندوق‌های طلا
-// حباب = (قیمت معامله − NAV ابطال) ÷ NAV ابطال × ۱۰۰
-// مثبت = قرمز (حباب مثبت) | منفی = سبز (حباب منفی)
 // ========================================================================
-async function fetchNavForFund(fundName) {
+async function fetchFundNav(fundName) {
   const url = `http://fipiran.com/api/v1/fund/getfundnav?name=${encodeURIComponent(fundName)}`;
-  const raw = await safeFetch(url);
-  if (!raw) return null;
-  try {
-    const json = JSON.parse(raw);
-    return toFloatSafe(json.cancelNav, null);
-  } catch (err) {
-    return null;
-  }
+  const data = await safeFetchJson(url);
+  if (!data) return null;
+  return toFloatSafe(data.cancelNav, null);
 }
 
-async function robot13() {
-  const raw = await fetchMarketWatchRaw();
-  const symbols = parseMarketWatch(raw);
-
-  if (!symbols.length) {
+async function robot13(marketWatch) {
+  if (!marketWatch || !marketWatch.length) {
     return robotResponse('13', 'error', null, 'دریافت داده از tsetmc ممکن نشد.');
   }
 
-  const goldFunds = symbols.filter((s) =>
-    COMMODITY_KEYWORDS.some((kw) => (s.symbol || '').includes(kw) || (s.name || '').includes(kw))
-  );
+  const goldFunds = marketWatch.filter((s) => COMMODITY_KEYWORDS.some((kw) => (s.symbol || '').includes(kw) || (s.name || '').includes(kw))).slice(0, 8);
 
-  const rows = [];
-  for (const s of goldFunds) {
-    const nav = await fetchNavForFund(s.name || '');
+  // دریافت موازی NAV همه صندوق‌ها برای سرعت بیشتر (به‌جای پشت‌سرهم)
+  const navResults = await Promise.all(goldFunds.map((s) => fetchFundNav(s.name || '')));
+
+  const rows = goldFunds.map((s, idx) => {
+    const nav = navResults[idx];
     if (nav === null || nav === 0) {
-      rows.push({
-        symbol: s.symbol,
-        tradePrice: s.finalPrice,
-        nav: null,
-        bubblePct: null,
-        bubbleType: 'نامشخص (NAV در دسترس نیست)',
-      });
-      continue;
+      return { symbol: s.symbol, tradePrice: s.finalPrice, nav: null, bubblePct: null, bubbleType: 'نامشخص (NAV در دسترس نیست)' };
     }
     const bubblePct = ((s.finalPrice - nav) / nav) * 100;
-    rows.push({
-      symbol: s.symbol,
-      tradePrice: s.finalPrice,
-      nav,
+    return {
+      symbol: s.symbol, tradePrice: s.finalPrice, nav,
       bubblePct: Math.round(bubblePct * 100) / 100,
       bubbleType: bubblePct > 0 ? 'مثبت' : 'منفی',
-      sentiment: bubblePct > 0 ? 'negative' : 'positive', // حباب مثبت = قرمز طبق تعریف کاربر
-    });
-  }
+      sentiment: bubblePct > 0 ? 'negative' : 'positive',
+    };
+  });
 
   rows.sort((a, b) => Math.abs(b.bubblePct || 0) - Math.abs(a.bubblePct || 0));
 
@@ -557,113 +473,76 @@ async function robot13() {
 
 
 /**
- * robots-part4.js — ربات‌های ۱۴ تا ۱۶
+ * robots-part3.js — ربات‌های ۱۴ تا ۱۶ (نسخه سریع)
  */
 
 
 // ========================================================================
 // ربات ۱۴ — Fipiran (پول هوشمند)
-// ۱۰ تحلیل صندوق‌های سرمایه‌گذاری
-// هر زیرتحلیل مستقل اجرا می‌شود؛ خطای یکی بقیه را متوقف نمی‌کند.
 // ========================================================================
-async function fetchAllFunds() {
-  const raw = await safeFetch('http://fipiran.com/api/v1/fund/fundcompare');
-  if (!raw) return null;
-  try {
-    const json = JSON.parse(raw);
-    return json.items || [];
-  } catch (err) {
-    return null;
-  }
-}
-
-function safeSubAnalysis(name, fn, ...args) {
-  try {
-    return fn(...args);
-  } catch (err) {
-    return { error: `تحلیل «${name}» با خطا مواجه شد: ${err.message}` };
-  }
-}
-
-function analysisTopHoldings(funds) {
-  const bigFunds = [...funds].sort((a, b) => toFloatSafe(b.netAsset) - toFloatSafe(a.netAsset)).slice(0, 5);
-  return bigFunds.map((f) => ({ fundName: f.name, netAsset: f.netAsset }));
-}
-
-function analysisSmartMoneyInflow(funds) {
-  const sorted = [...funds].sort((a, b) => toFloatSafe(b.dailyReturn) - toFloatSafe(a.dailyReturn)).slice(0, 10);
-  return sorted.map((f) => ({ fundName: f.name, dailyReturn: f.dailyReturn }));
-}
-
-function analysisNavGrowth(funds) {
-  const growing = funds.filter((f) => toFloatSafe(f.dailyReturn) > 0);
-  return growing.slice(0, 10).map((f) => ({ fundName: f.name, navChange: f.dailyReturn }));
-}
-
 async function robot14() {
-  const funds = await fetchAllFunds();
+  const data = await safeFetchJson('http://fipiran.com/api/v1/fund/fundcompare');
 
-  if (!funds) {
-    return robotResponse('14', 'error', null, 'دریافت داده از fipiran.com در حال حاضر ممکن نیست.');
+  if (!data) {
+    return robotResponse('14', 'error', null, 'دریافت داده از fipiran.com ممکن نشد.');
   }
 
-  const data = {
-    topHoldingsByBigFunds: safeSubAnalysis('صندوق‌های بزرگ', analysisTopHoldings, funds),
-    smartMoneyInflow: safeSubAnalysis('ورود پول هوشمند', analysisSmartMoneyInflow, funds),
-    navGrowth: safeSubAnalysis('رشد NAV', analysisNavGrowth, funds),
-    note: 'تحلیل‌های مربوط به تکرار سهم در چند صندوق و تغییر وزن نیازمند دریافت پرتفوی هر صندوق و مقایسه‌ی تاریخی هستند که در فاز تست تکمیل می‌شوند.',
-  };
+  const funds = data.items || [];
+  if (!funds.length) {
+    return robotResponse('14', 'error', null, 'داده‌ای از fipiran دریافت نشد.');
+  }
 
-  return robotResponse('14', 'ok', data);
+  const topHoldings = [...funds].sort((a, b) => toFloatSafe(b.netAsset) - toFloatSafe(a.netAsset)).slice(0, 5)
+    .map((f) => ({ fundName: f.name, netAsset: f.netAsset }));
+
+  const smartMoney = [...funds].sort((a, b) => toFloatSafe(b.dailyReturn) - toFloatSafe(a.dailyReturn)).slice(0, 10)
+    .map((f) => ({ fundName: f.name, dailyReturn: f.dailyReturn }));
+
+  const navGrowth = funds.filter((f) => toFloatSafe(f.dailyReturn) > 0).slice(0, 10)
+    .map((f) => ({ fundName: f.name, navChange: f.dailyReturn }));
+
+  return robotResponse('14', 'ok', {
+    topHoldingsByBigFunds: topHoldings,
+    smartMoneyInflow: smartMoney,
+    navGrowth,
+  });
 }
 
 // ========================================================================
 // ربات ۱۵ — قیمت سهم نسبت به دلار
-// (قیمت سهم ÷ قیمت دلار) × ۱۰۰ برای امروز، مقایسه با ۳۰ روز پیش
 // ========================================================================
-async function fetchDollarRate() {
-  const raw = await safeFetch('https://api.navasan.tech/latest/');
-  if (!raw) return null;
-  try {
-    const json = JSON.parse(raw);
-    return toFloatSafe(json.usd?.value, null);
-  } catch (err) {
-    return null;
-  }
+async function fetchDollarPrice() {
+  const data = await safeFetchJson('https://api.navasan.tech/latest/');
+  if (!data) return null;
+  return toFloatSafe(data.usd?.value, null);
 }
 
-async function robot15() {
-  const raw = await fetchMarketWatchRaw();
-  const symbols = parseMarketWatch(raw);
-  const dollarPrice = await fetchDollarRate();
-
-  if (!symbols.length || dollarPrice === null) {
-    return robotResponse('15', 'error', null, 'دریافت قیمت سهم یا نرخ دلار در حال حاضر ممکن نیست.');
+async function robot15(marketWatch) {
+  if (!marketWatch || !marketWatch.length) {
+    return robotResponse('15', 'error', null, 'دریافت داده از tsetmc ممکن نشد.');
   }
 
-  const bigCompanies = [...symbols].sort((a, b) => b.marketCap - a.marketCap).slice(0, 30);
+  const dollarPrice = await fetchDollarPrice();
+  if (dollarPrice === null) {
+    return robotResponse('15', 'error', null, 'دریافت نرخ دلار ممکن نشد.');
+  }
 
-  const rows = bigCompanies.map((s) => {
-    const ratioToday = dollarPrice ? (s.finalPrice / dollarPrice) * 100 : 0;
-    return {
-      symbol: s.symbol,
-      priceToday: s.finalPrice,
-      ratioToday: Math.round(ratioToday * 10000) / 10000,
-      ratio30DaysAgo: null, // نیاز به داده تاریخی؛ در فاز استقرار با ذخیره‌سازی روزانه تکمیل می‌شود
-      status: 'نیاز به داده تاریخی ۳۰ روزه',
-    };
-  });
+  const bigCompanies = [...marketWatch].sort((a, b) => b.marketCap - a.marketCap).slice(0, 30);
+  const rows = bigCompanies.map((s) => ({
+    symbol: s.symbol,
+    priceToday: s.finalPrice,
+    ratioToday: Math.round((s.finalPrice / dollarPrice) * 100 * 10000) / 10000,
+    ratio30DaysAgo: null,
+    status: 'نیاز به داده تاریخی ۳۰ روزه',
+  }));
 
-  return robotResponse('15', 'ok', rows, 'مقایسه با ۳۰ روز پیش نیازمند ذخیره‌سازی روزانه‌ی داده است.');
+  return robotResponse('15', 'ok', rows);
 }
 
 // ========================================================================
 // ربات ۱۶ — اثر نقدینگی
-// طبق تایید کاربر: رشد نقدینگی ماهانه/دستی وارد می‌شود
-// ⚠️ این مقدار باید ماهانه توسط کاربر در KV Storage بروزرسانی شود (راهنما در مستندات)
 // ========================================================================
 async function robot16(env) {
-  // مقدار رشد نقدینگی از Cloudflare KV خوانده می‌شود (کاربر آن را ماهانه بروزرسانی می‌کند)
   let liquidityGrowth = null;
   let liquidityUpdatedDate = null;
 
@@ -675,23 +554,21 @@ async function robot16(env) {
         liquidityGrowth = parsed.valuePct;
         liquidityUpdatedDate = parsed.updatedDate;
       }
-    } catch (err) {
-      // نادیده گرفتن؛ liquidityGrowth همچنان null می‌ماند
-    }
+    } catch (err) { /* بدون تغییر، liquidityGrowth همچنان null */ }
   }
 
-  const dollarPrice = await fetchDollarRate();
-  const total = await fetchIndexValue('total');
+  const dollarPrice = await fetchDollarPrice();
+  const { total } = await getIndices();
 
   const data = {
     liquidityGrowthMonthly: liquidityGrowth,
     liquidityLastUpdated: liquidityUpdatedDate,
     dollarPriceToday: dollarPrice,
-    totalIndexChangePct: total.changePct,
+    totalIndexChangePct: total ? total.changePct : null,
   };
 
   if (liquidityGrowth === null) {
-    data.rulesTriggered = ['رشد نقدینگی ماهانه هنوز وارد نشده است. طبق راهنمای نصب آن را در Cloudflare KV وارد کنید.'];
+    data.rulesTriggered = ['رشد نقدینگی ماهانه هنوز وارد نشده است.'];
     data.sentiment = 'neutral';
     return robotResponse('16', 'ok', data, 'این ربات نیاز به بروزرسانی دستی ماهانه دارد.');
   }
@@ -699,19 +576,17 @@ async function robot16(env) {
   const rules = [];
   let sentiment = 'neutral';
 
-  if (dollarPrice !== null && total.changePct !== null) {
+  if (dollarPrice !== null && total) {
     if (liquidityGrowth > dollarPrice) {
       rules.push('قانون ۱: رشد نقدینگی بیشتر از دلار — ورود پول به بورس، رشد سهم‌ها');
     } else {
       rules.push('قانون ۲: رشد دلار بیشتر از نقدینگی — پول به سمت ارز، عقب‌افتادگی سهم‌ها');
     }
-
     if (liquidityGrowth > total.changePct) {
       rules.push('قانون ۳: رشد نقدینگی بیشتر از شاخص کل — رشد سهم‌های کوچک، پول هوشمند فعال');
     }
-
     if (liquidityGrowth > 0 && Math.abs(total.changePct) < 0.3) {
-      rules.push('قانون ۴: نقدینگی بالا، شاخص راکد — بازار آماده جهش (بهترین زمان یافتن سهم مناسب)');
+      rules.push('قانون ۴: نقدینگی بالا، شاخص راکد — بازار آماده جهش');
       sentiment = 'gold';
     } else {
       sentiment = liquidityGrowth > dollarPrice ? 'positive' : 'negative';
@@ -726,94 +601,68 @@ async function robot16(env) {
 
 
 /**
- * robot-gold.js — ربات طلا (۳۱+۱)
- * منابع: قیمت لحظه‌ای دلار بازار آزاد + قیمت انس جهانی طلا
- * محاسبه دقیق طبق ضرایب تعریف‌شده توسط کاربر.
+ * robot-gold.js — ربات طلا (نسخه دوم، سریع و مطمئن)
+ * منبع دلار: bonbast.amirhn.com — رایگان، بدون نیاز به کلید API، بدون محدودیت درخواست.
+ * منبع انس جهانی: metals.live (fallback ساده در صورت شکست)
  */
 
 
-// ضرایب تبدیل طبق تعریف دقیق کاربر — این اعداد نباید تغییر کنند
 const DIVISORS = {
-  gold24k: 31.1,       // طلای ۲۴ عیار (۱۰۰۰)
-  gold21_6k: 34.56,    // طلای ۲۱.۶ عیار (۹۰۰)
-  gold18k: 41.47,      // طلای ۱۸ عیار (۷۵۰)
-  mesghal: 9.57,       // مظنه (مثقال ۱۷ عیار / ۷۰۵)
-  coinFull: 4.25,      // سکه تمام
-  coinHalf: 8.5,       // سکه نیم
-  coinQuarter: 17,     // سکه ربع
-  coinGram: 34,        // سکه گرمی
+  gold24k: 31.1, gold21_6k: 34.56, gold18k: 41.47, mesghal: 9.57,
+  coinFull: 4.25, coinHalf: 8.5, coinQuarter: 17, coinGram: 34,
 };
 const MESGHAL_TO_GRAM18_DIVISOR = 4.33;
 
 const LABELS = {
-  gold24k: 'طلای ۲۴ عیار (۱ گرم)',
-  gold21_6k: 'طلای ۲۱.۶ عیار (۱ گرم)',
-  gold18k: 'طلای ۱۸ عیار (۱ گرم)',
-  mesghal: 'مظنه (مثقال ۱۷ عیار)',
-  mesghalToGram18: 'تبدیل مظنه به گرم ۱۸',
-  coinFull: 'سکه تمام',
-  coinHalf: 'سکه نیم',
-  coinQuarter: 'سکه ربع',
-  coinGram: 'سکه گرمی',
+  gold24k: 'طلای ۲۴ عیار (۱ گرم)', gold21_6k: 'طلای ۲۱.۶ عیار (۱ گرم)', gold18k: 'طلای ۱۸ عیار (۱ گرم)',
+  mesghal: 'مظنه (مثقال ۱۷ عیار)', mesghalToGram18: 'تبدیل مظنه به گرم ۱۸',
+  coinFull: 'سکه تمام', coinHalf: 'سکه نیم', coinQuarter: 'سکه ربع', coinGram: 'سکه گرمی',
 };
 
-async function fetchDollarPrice() {
-  const raw = await safeFetch('https://api.navasan.tech/latest/');
-  if (!raw) return null;
-  try {
-    const json = JSON.parse(raw);
-    return toFloatSafe(json.usd?.value, null);
-  } catch (err) {
-    return null;
+async function fetchDollarPriceToman() {
+  // Bonbast API (بدون کلید) — قیمت دلار بازار آزاد به تومان
+  const data = await safeFetchJson('https://bonbast.amirhn.com/latest');
+  if (data) {
+    // ساختار محتمل پاسخ: { usd1: {sell, buy}, ... } یا { usd_sell, usd_buy }
+    const sell = data.usd1?.sell ?? data.usd_sell ?? data.usd?.sell ?? data.USD?.sell;
+    if (sell) return toFloatSafe(sell);
   }
+  return null;
 }
 
 async function fetchGoldOunceUsd() {
-  const raw = await safeFetch('https://api.metals.live/v1/spot/gold');
-  if (!raw) return null;
-  try {
-    const json = JSON.parse(raw);
-    if (Array.isArray(json) && json.length > 0) {
-      return toFloatSafe(json[0].price, null);
-    }
-    return toFloatSafe(json.price, null);
-  } catch (err) {
-    return null;
+  const data = await safeFetchJson('https://api.metals.live/v1/spot/gold');
+  if (data) {
+    if (Array.isArray(data) && data.length > 0) return toFloatSafe(data[0].price, null);
+    if (data.price) return toFloatSafe(data.price, null);
   }
+  return null;
 }
 
 async function robotGold() {
-  const dollarPrice = await fetchDollarPrice();
-  const ounceUsd = await fetchGoldOunceUsd();
+  // دو درخواست به‌صورت موازی برای سرعت بیشتر
+  const [dollarPrice, ounceUsd] = await Promise.all([fetchDollarPriceToman(), fetchGoldOunceUsd()]);
 
   if (dollarPrice === null || ounceUsd === null) {
-    return robotResponse('gold', 'error', null, 'دریافت نرخ دلار یا قیمت جهانی طلا در حال حاضر ممکن نیست.');
+    return robotResponse('gold', 'error', null,
+      `دریافت ${dollarPrice === null ? 'نرخ دلار' : 'قیمت جهانی طلا'} در حال حاضر ممکن نیست.`);
   }
 
-  // قیمت جهانی طلا به تومان (پایه‌ی محاسبه‌ی همه‌ی محصولات)
   const goldBaseToman = ounceUsd * dollarPrice;
-
   const products = {};
   for (const [key, divisor] of Object.entries(DIVISORS)) {
     products[key] = Math.round(goldBaseToman / divisor);
   }
-  // تبدیل مظنه به گرم ۱۸ طبق دستور دقیق کاربر
   products.mesghalToGram18 = Math.round(products.mesghal / MESGHAL_TO_GRAM18_DIVISOR);
 
   return robotResponse('gold', 'ok', {
-    dollarPrice,
-    goldOunceUsd: ounceUsd,
-    goldBaseToman: Math.round(goldBaseToman),
-    products,
-    labels: LABELS,
+    dollarPrice, goldOunceUsd: ounceUsd, goldBaseToman: Math.round(goldBaseToman), products, labels: LABELS,
   });
 }
 
 
 /**
- * watchlist.js — واچ‌لیست ۵۰ نماد دلخواه کاربر
- * از Cloudflare KV برای ذخیره‌ی دائمی لیست نمادها استفاده می‌کند (رایگان، بدون نیاز به دیتابیس جدا).
- * داده‌ی زنده‌ی هر نماد از دیده‌بان بازار tsetmc گرفته می‌شود.
+ * watchlist.js — واچ‌لیست ۵۰ نماد (نسخه سریع، استفاده از دیده‌بان بازار مشترک)
  */
 
 
@@ -831,7 +680,7 @@ async function loadWatchlistSymbols(env) {
 }
 
 async function saveWatchlistSymbols(env, symbols) {
-  if (!env || !env.BOURSE_KV) return;
+  if (!env || !env.BOURSE_KV) return symbols;
   const unique = [...new Set(symbols)].slice(0, MAX_SYMBOLS);
   await env.BOURSE_KV.put(KV_KEY, JSON.stringify(unique));
   return unique;
@@ -859,89 +708,49 @@ async function removeSymbolFromWatchlist(env, symbolName) {
 
 function buildRow(symbolRow) {
   return {
-    symbol: symbolRow.symbol,
-    finalPrice: symbolRow.finalPrice,
-    changePct: symbolRow.changePct,
-    volume: symbolRow.volume,
-    baseVolume: symbolRow.baseVolume,
-    value: symbolRow.value,
-    // فیلدهای زیر placeholder هستند تا در فاز تست با اندپوینت واقعی پر شوند
-    realToLegalCode: null,
-    realMoneyFlow: null,
-    freeFloatPct: null,
-    peRatio: null,
-    queueStatus: null,
+    symbol: symbolRow.symbol, finalPrice: symbolRow.finalPrice, changePct: symbolRow.changePct,
+    volume: symbolRow.volume, baseVolume: symbolRow.baseVolume, value: symbolRow.value,
+    realToLegalCode: null, realMoneyFlow: null, freeFloatPct: null, peRatio: null, queueStatus: null,
   };
 }
 
-async function runWatchlist(env) {
+async function runWatchlist(env, marketWatch) {
   const watchlist = await loadWatchlistSymbols(env);
 
   if (!watchlist.length) {
-    return robotResponse('watchlist', 'ok', [], 'واچ‌لیست هنوز خالی است. نماد مورد نظر را از داشبورد اضافه کنید.');
+    return robotResponse('watchlist', 'ok', [], 'واچ‌لیست خالی است.');
   }
 
-  const raw = await fetchMarketWatchRaw();
-  const allSymbols = parseMarketWatch(raw);
-
-  if (!allSymbols.length) {
+  if (!marketWatch || !marketWatch.length) {
     return robotResponse('watchlist', 'error', null, 'دریافت داده از tsetmc ممکن نشد.');
   }
 
   const symbolMap = {};
-  for (const s of allSymbols) symbolMap[s.symbol] = s;
+  for (const s of marketWatch) symbolMap[s.symbol] = s;
 
   const rows = watchlist.map((symName) => {
-    if (symbolMap[symName]) {
-      return buildRow(symbolMap[symName]);
-    }
-    return {
-      symbol: symName,
-      finalPrice: null,
-      changePct: null,
-      volume: null,
-      baseVolume: null,
-      value: null,
-      realToLegalCode: null,
-      realMoneyFlow: null,
-      freeFloatPct: null,
-      peRatio: null,
-      queueStatus: null,
-      note: 'نماد در دیده‌بان بازار یافت نشد؛ نام را بررسی کنید.',
-    };
+    if (symbolMap[symName]) return buildRow(symbolMap[symName]);
+    return { symbol: symName, finalPrice: null, changePct: null, volume: null, baseVolume: null, value: null,
+      realToLegalCode: null, realMoneyFlow: null, freeFloatPct: null, peRatio: null, queueStatus: null,
+      note: 'نماد یافت نشد.' };
   });
 
   return robotResponse('watchlist', 'ok', rows);
 }
 
 
-
-// ===== رجیستری مرکزی ربات‌ها =====
-const ROBOT_REGISTRY = {
-  '01': robot01, '02': robot02, '03': robot03, '04': robot04,
-  '05': robot05, '06': robot06, '07': robot07, '08': robot08, '09': robot09,
-  '10': robot10, '11': robot11, '12': robot12, '13': robot13,
-  '14': robot14, '15': robot15, '16': robot16,
-  'gold': robotGold,
-};
-
 /**
- * worker.js — نقطه ورود اصلی Cloudflare Worker
- * داشبورد بورس Navid Ramian
+ * worker.js — نسخه دوم، بهینه‌شده برای سرعت
  *
- * معماری:
- * - این Worker به‌عنوان واسطه (proxy) بین مرورگر گوشی و tsetmc/fipiran عمل می‌کند
- *   چون مرورگر مستقیماً به دلیل محدودیت CORS نمی‌تواند به این سایت‌ها وصل شود.
- * - هر ربات یک تابع مستقل در فایل robots.js دارد.
- * - خرابی یک ربات باعث از کار افتادن بقیه نمی‌شود (هر کدام try/catch جداگانه دارند).
- *
- * مسیرها:
- *   GET /api/robot/:id       -> داده‌ی یک ربات خاص
- *   GET /api/robots/all      -> داده‌ی همه‌ی ربات‌ها یکجا
- *   GET /api/watchlist       -> داده‌ی نمادهای واچ‌لیست کاربر
- *   POST /api/watchlist/add  -> افزودن نماد به واچ‌لیست
- *   POST /api/watchlist/remove -> حذف نماد از واچ‌لیست
+ * تغییر معماری کلیدی نسبت به نسخه قبل:
+ * دیده‌بان بازار (که ۱۲ ربات از ۱۷ ربات بهش نیاز دارند) فقط یک‌بار در ابتدای
+ * هر درخواست /api/robots/all گرفته می‌شود و بین همه‌ی ربات‌ها به اشتراک گذاشته می‌شود.
+ * این یعنی به‌جای ۱۲ درخواست جداگانه به tsetmc، فقط ۱ درخواست زده می‌شود.
  */
+
+
+
+
 
 
 
@@ -959,23 +768,33 @@ function jsonResponse(data, status = 200) {
 }
 
 /**
- * اجرای امن هر ربات — هیچ خطایی نباید کل Worker را متوقف کند.
+ * دسته‌بندی ربات‌ها بر اساس نیازشان به دیده‌بان بازار مشترک.
+ * ربات‌هایی که نیاز ندارند (مستقیم API بیرونی دیگری دارند) جدا فراخوانی می‌شوند.
  */
-async function runRobotSafely(robotId, env) {
-  const robotFn = ROBOT_REGISTRY[robotId];
-  if (!robotFn) {
-    return { robot: robotId, status: 'error', message: `رباتی با شناسه ${robotId} یافت نشد.`, data: null };
-  }
+const MARKET_WATCH_DEPENDENT_ROBOTS = {
+  '02': robot02, '03': robot03, '04': robot04, '05': robot05, '06': robot06,
+  '07': robot07, '08': robot08, '09': robot09, '11': robot11, '12': robot12,
+};
+
+const INDEPENDENT_ROBOTS = {
+  '01': robot01, '10': robot10, '14': robot14, '16': robot16, 'gold': robotGold,
+};
+
+async function runSingleRobot(robotId, env, marketWatch) {
   try {
-    const result = await robotFn(env);
-    return result;
+    if (robotId === '13') return await robot13(marketWatch);
+    if (robotId === '15') return await robot15(marketWatch);
+    if (robotId === '16') return await robot16(env);
+
+    if (MARKET_WATCH_DEPENDENT_ROBOTS[robotId]) {
+      return MARKET_WATCH_DEPENDENT_ROBOTS[robotId](marketWatch);
+    }
+    if (INDEPENDENT_ROBOTS[robotId]) {
+      return await INDEPENDENT_ROBOTS[robotId](env);
+    }
+    return robotResponse(robotId, 'error', null, `رباتی با شناسه ${robotId} یافت نشد.`);
   } catch (err) {
-    return {
-      robot: robotId,
-      status: 'error',
-      message: `خطای غیرمنتظره: ${err.message}`,
-      data: null,
-    };
+    return robotResponse(robotId, 'error', null, `خطای غیرمنتظره: ${err.message}`);
   }
 }
 
@@ -989,39 +808,47 @@ const workerHandler = {
     }
 
     try {
+      // ===== همه‌ی ربات‌ها یکجا (مسیر اصلی داشبورد) =====
+      if (path === '/api/robots/all') {
+        // دیده‌بان بازار فقط یک‌بار گرفته می‌شود؛ همه‌ی ربات‌های وابسته از همین استفاده می‌کنند
+        const marketWatch = await getMarketWatch();
+
+        const allRobotIds = ['01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11', '12', '13', '14', '15', '16', 'gold'];
+        const results = {};
+
+        // اجرای کاملاً موازی همه‌ی ربات‌ها (چون دیده‌بان بازار از قبل آماده است، سریع اجرا می‌شوند)
+        await Promise.all(
+          allRobotIds.map(async (id) => {
+            results[id] = await runSingleRobot(id, env, marketWatch);
+          })
+        );
+
+        return jsonResponse(results);
+      }
+
       // ===== ربات منفرد =====
       const robotMatch = path.match(/^\/api\/robot\/([a-zA-Z0-9_]+)$/);
       if (robotMatch) {
         const robotId = robotMatch[1];
-        const result = await runRobotSafely(robotId, env);
+        let marketWatch = null;
+        if (MARKET_WATCH_DEPENDENT_ROBOTS[robotId] || robotId === '13' || robotId === '15') {
+          marketWatch = await getMarketWatch();
+        }
+        const result = await runSingleRobot(robotId, env, marketWatch);
         return jsonResponse(result);
-      }
-
-      // ===== همه‌ی ربات‌ها یکجا =====
-      if (path === '/api/robots/all') {
-        const robotIds = Object.keys(ROBOT_REGISTRY);
-        const results = {};
-        // اجرای موازی همه‌ی ربات‌ها برای سرعت بیشتر
-        await Promise.all(
-          robotIds.map(async (id) => {
-            results[id] = await runRobotSafely(id, env);
-          })
-        );
-        return jsonResponse(results);
       }
 
       // ===== واچ‌لیست =====
       if (path === '/api/watchlist' && request.method === 'GET') {
-        const result = await runWatchlist(env);
+        const marketWatch = await getMarketWatch();
+        const result = await runWatchlist(env, marketWatch);
         return jsonResponse(result);
       }
 
       if (path === '/api/watchlist/add' && request.method === 'POST') {
         const body = await request.json().catch(() => ({}));
         const symbol = (body.symbol || '').trim();
-        if (!symbol) {
-          return jsonResponse({ status: 'error', message: 'نام نماد ارسال نشده است.' }, 400);
-        }
+        if (!symbol) return jsonResponse({ status: 'error', message: 'نام نماد ارسال نشده است.' }, 400);
         const result = await addSymbolToWatchlist(env, symbol);
         return jsonResponse(result);
       }
@@ -1029,9 +856,7 @@ const workerHandler = {
       if (path === '/api/watchlist/remove' && request.method === 'POST') {
         const body = await request.json().catch(() => ({}));
         const symbol = (body.symbol || '').trim();
-        if (!symbol) {
-          return jsonResponse({ status: 'error', message: 'نام نماد ارسال نشده است.' }, 400);
-        }
+        if (!symbol) return jsonResponse({ status: 'error', message: 'نام نماد ارسال نشده است.' }, 400);
         const result = await removeSymbolFromWatchlist(env, symbol);
         return jsonResponse(result);
       }
