@@ -1,0 +1,7 @@
+name = "bours-worker"
+main = "index.js"
+compatibility_date = "2024-09-01"
+
+[[kv_namespaces]]
+binding = "BOURSE_KV"
+id = "YOUR_KV_NAMESPACE_ID_HERE"
