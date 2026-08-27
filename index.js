@@ -1,6 +1,5 @@
 /**
- * index.js — نسخه دوم Worker، بهینه برای سرعت
- * شامل: کلاینت tsetmc با timeout، هر ۱۶ ربات + طلا، واچ‌لیست، روتر اصلی
+ * index.js — نسخه سوم Worker، با اندپوینت تشخیصی موقت
  */
 
 /**
@@ -740,6 +739,51 @@ async function runWatchlist(env, marketWatch) {
 
 
 /**
+ * debug.js — اندپوینت تشخیصی موقت
+ * برای فهمیدن دقیق اینکه چرا اتصال به tsetmc شکست می‌خورد:
+ * کد وضعیت HTTP، پیام خطای دقیق، و ۵۰۰ کاراکتر اول پاسخ (در صورت وجود) را نشان می‌دهد.
+ * بعد از رفع مشکل، این فایل و مسیرش از worker حذف می‌شود.
+ */
+
+const DEBUG_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Accept': 'application/json, text/plain, */*',
+  'Referer': 'http://www.tsetmc.com/',
+};
+
+async function testUrl(url, label) {
+  const result = { label, url, ok: false, httpStatus: null, error: null, sample: null };
+  try {
+    const resp = await fetch(url, { headers: DEBUG_HEADERS });
+    result.httpStatus = resp.status;
+    result.ok = resp.ok;
+    if (resp.ok) {
+      const text = await resp.text();
+      result.sample = text.substring(0, 300);
+    } else {
+      const text = await resp.text().catch(() => '');
+      result.sample = text.substring(0, 300);
+    }
+  } catch (err) {
+    result.error = err.message || String(err);
+  }
+  return result;
+}
+
+async function runDiagnostics() {
+  const urls = [
+    { url: 'http://cdn.tsetmc.com/api/ClosingPrice/GetMarketWatch', label: 'MarketWatch REST جدید' },
+    { url: 'http://www.tsetmc.com/tsev2/data/MarketWatchInit.aspx?h=0&r=0', label: 'MarketWatch قدیمی' },
+    { url: 'https://bonbast.amirhn.com/latest', label: 'Bonbast دلار' },
+    { url: 'http://fipiran.com/api/v1/fund/fundcompare', label: 'Fipiran' },
+  ];
+
+  const results = await Promise.all(urls.map((u) => testUrl(u.url, u.label)));
+  return results;
+}
+
+
+/**
  * worker.js — نسخه دوم، بهینه‌شده برای سرعت
  *
  * تغییر معماری کلیدی نسبت به نسخه قبل:
@@ -864,6 +908,12 @@ const workerHandler = {
       // ===== سلامت سرویس =====
       if (path === '/api/health') {
         return jsonResponse({ status: 'ok', message: 'Worker در حال اجراست.' });
+      }
+
+      // ===== تشخیصی موقت — برای پیدا کردن علت دقیق شکست اتصال =====
+      if (path === '/api/debug') {
+        const diagnostics = await runDiagnostics();
+        return jsonResponse({ status: 'ok', diagnostics });
       }
 
       return jsonResponse({ status: 'error', message: 'مسیر یافت نشد.' }, 404);
